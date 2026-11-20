@@ -10,6 +10,9 @@
   （保留空档的闭区间列表）；
 - **撤销重算**：删除对接/叠压后按剩余关系重新分组、重新求解。
 
+另提供**探方剖面**（层位顶、底折线的初版登记与局部复测返工，见下文
+[探方剖面](#探方剖面初版与复测)）。
+
 ## 快速开始（docker compose）
 
 ```bash
@@ -53,6 +56,85 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | DELETE | `/superpositions/{id}` | 撤销叠压并重算 |
 | GET | `/sites/{id}/solution` | 整站分组、组间边、各组全部可行年代段 |
 | GET | `/strata/{id}/correlation-view` | 按原始层位查同组成员与可行年代段 |
+
+### 探方剖面（初版与复测）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/sites/{id}/sections/{trench}` | 按遗址和探方登记初版剖面 |
+| POST | `/sites/{id}/sections` | 同上，探方编号写在请求体 `trench` |
+| GET | `/sites/{id}/sections` | 该遗址已登记剖面一览（含当前版号） |
+| GET | `/sites/{id}/sections/{trench}` | 当前版号与各层可精确重画的顶、底折线 |
+| GET | `/sites/{id}/sections/{trench}/version` | 只取当前版号 |
+| GET | `/strata/{id}/profile` | 按原始层位 ID 查其剖面的版号与该层折线 |
+| POST | `/sites/{id}/sections/{trench}/revisions` | 复测返工（局部替换） |
+| POST | `/sites/{id}/revisions` | 同上，探方编号写在请求体 `trench` |
+
+`/profiles`、`/trenches/{trench}/profile` 是 `/sections` 的同义路径
+（如 `/profiles/{trench}/revision`）；它们不出现在 `/docs` 列表中但行为一致。
+请求体也兼容若干常见字段别名（`top_points`/`top_line`/`points.top`、
+`seen_version`/`base_version`、`cuts`/`cut`/`x1,x2`、测点 `[x, y]` 等）。
+
+#### 初版登记
+
+同一探方各层共用**同一个整数毫米横距范围** `[x_min, x_max]`；每层用既有**层位 ID**
+（`stratum_id`）关联一个已登记层位，并给出顶线与底线的折线测点
+（`{"x": 整数毫米, "y": 整数毫米}` 或 `[x, y]`）。两条折线的首末横距都必须恰好是
+`x_min` 与 `x_max`，横距严格递增。
+
+```bash
+SID=1
+curl -X POST localhost:8000/sites/$SID/sections/T1 -H 'Content-Type: application/json' -d '{
+  "x_min": 0, "x_max": 4000,
+  "layers": [
+    {"stratum_id": 1,
+     "top":    [{"x": 0, "y": 820}, {"x": 2000, "y": 860}, {"x": 4000, "y": 800}],
+     "bottom": [{"x": 0, "y": 700}, {"x": 4000, "y": 720}]},
+    {"stratum_id": 2,
+     "top":    [{"x": 0, "y": 700}, {"x": 4000, "y": 720}],
+     "bottom": [{"x": 0, "y": 540}, {"x": 4000, "y": 560}]}
+  ]
+}'
+```
+
+规则：**每层顶线不得低于其底线**（可重合）；**不同层允许共边**（例如上层底线与
+下层顶线完全重合），但两层带厚度的内部不得重叠。共边之外的任何内部重叠都拒绝。
+
+#### 复测返工
+
+一次复测只返工**一段**：提交所见**版号**、范围内的两个**整数毫米切口**
+`cut_x1 < cut_x2`，以及各层在两切口**之间**的新测点（可以为空）。
+
+- 切口处的高程由**旧折线精确线性插值**得到；切口落在两个旧测点之间时**不取整**，
+  以分数保存（接口同时返回 `top_exact` 等 `"分子/分母"` 精确值与浮点近似）。
+- 两个切口之间没有新测点时，两切口**直接相连**。
+- **替换区间之外**（含此前返工产生的切口点）原样保留当次复测前的线形。
+- 只有请求中列出的层位会被返工，其余层位保持不变。
+
+```bash
+# 所见版号 1，返工 [1200, 2600] 段，仅第 1 层
+curl -X POST localhost:8000/sites/$SID/sections/T1/revisions \
+  -H 'Content-Type: application/json' -d '{
+  "version": 1, "cut_x1": 1200, "cut_x2": 2600,
+  "layers": [
+    {"stratum_id": 1,
+     "top_points":    [{"x": 1700, "y": 905}],
+     "bottom_points": []}
+  ]
+}'
+```
+
+整次拒绝（`409`，库内原图与版号保持不变）的情形：
+
+- 切口越界或顺序不对（`CUT_OUT_OF_RANGE`）、新测点落在切口之外
+  （`POINT_OUT_OF_RANGE`）；
+- 版号过期（`STALE_VERSION`）：请求版号不等于当前版号；
+- 拼接后违反剖面规则（`TOP_BELOW_BOTTOM`、`LAYER_OVERLAP` 等）；
+- 写入失败（`WRITE_FAILED`）。
+
+成功时 `version` 加 1，响应即返回新图，`GET` 查询立即可见；重启后同一数据库
+文件读到的版号与折线完全相同（折线以整数分子/分母精确落库）。
+
 
 ### 录入示例
 
@@ -107,4 +189,7 @@ python -m pytest tests/ -q
 ```
 
 覆盖区间工具、缺口域求解、成环/空域/次序冲突及矛盾见证、40 层上限、
-无解拒绝与旧结论保留、撤销重算、并发写入串行化、重启后结论恢复。
+无解拒绝与旧结论保留、撤销重算、并发写入串行化、重启后结论恢复；
+以及剖面初版登记、切口落在测点之间的精确分数高程、连续复测区间外线形保持、
+版号过期/切口越界/顶底颠倒/层间内部重叠/写入失败的整次拒绝与回滚、重启后
+剖面版号与折线不变。

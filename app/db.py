@@ -61,10 +61,48 @@ CREATE TABLE IF NOT EXISTS superpositions (
     UNIQUE (site_id, lower_id, upper_id)
 );
 
+-- 探方剖面：同一遗址同一探方只有一张剖面；version 为当前版号。
+CREATE TABLE IF NOT EXISTS sections (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    site_id INTEGER NOT NULL REFERENCES sites(id),
+    trench  TEXT NOT NULL,
+    x_min   INTEGER NOT NULL,
+    x_max   INTEGER NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    created TEXT NOT NULL DEFAULT (datetime('now')),
+    updated TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (site_id, trench),
+    CHECK (x_min < x_max),
+    CHECK (version >= 1)
+);
+
+-- 剖面的每一层引用一个既有层位 ID（同一层位只归属于一张剖面）。
+CREATE TABLE IF NOT EXISTS section_layers (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    section_id  INTEGER NOT NULL REFERENCES sections(id) ON DELETE CASCADE,
+    stratum_id  INTEGER NOT NULL REFERENCES strata(id),
+    UNIQUE (section_id, stratum_id),
+    UNIQUE (stratum_id)
+);
+
+-- 精确高程以分数（分子/分母）文本保存，避免浮点与整数溢出。
+CREATE TABLE IF NOT EXISTS section_points (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    section_layer_id INTEGER NOT NULL REFERENCES section_layers(id) ON DELETE CASCADE,
+    side             TEXT NOT NULL CHECK (side IN ('top', 'bottom')),
+    seq              INTEGER NOT NULL,
+    x                INTEGER NOT NULL,
+    y_num            TEXT NOT NULL,
+    y_den            TEXT NOT NULL,
+    UNIQUE (section_layer_id, side, seq)
+);
+
 CREATE INDEX IF NOT EXISTS idx_strata_site ON strata(site_id);
 CREATE INDEX IF NOT EXISTS idx_intervals_stratum ON stratum_intervals(stratum_id);
 CREATE INDEX IF NOT EXISTS idx_corr_site ON correlations(site_id);
 CREATE INDEX IF NOT EXISTS idx_sup_site ON superpositions(site_id);
+CREATE INDEX IF NOT EXISTS idx_sections_site ON sections(site_id);
+CREATE INDEX IF NOT EXISTS idx_section_points_layer ON section_points(section_layer_id);
 """
 
 
@@ -286,3 +324,128 @@ def list_superpositions(
 
 def delete_superposition(conn: sqlite3.Connection, superposition_id: int) -> None:
     conn.execute("DELETE FROM superpositions WHERE id = ?", (superposition_id,))
+
+
+# ---------- 探方剖面 ----------
+
+def get_section(
+    conn: sqlite3.Connection, site_id: int, trench: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM sections WHERE site_id = ? AND trench = ?",
+        (site_id, trench),
+    ).fetchone()
+
+
+def get_section_by_id(
+    conn: sqlite3.Connection, section_id: int
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM sections WHERE id = ?", (section_id,)
+    ).fetchone()
+
+
+def list_sections(conn: sqlite3.Connection, site_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM sections WHERE site_id = ? ORDER BY id", (site_id,)
+    ).fetchall()
+
+
+def create_section(
+    conn: sqlite3.Connection,
+    site_id: int,
+    trench: str,
+    x_min: int,
+    x_max: int,
+    layers: list[tuple[int, list[tuple[int, str, str]], list[tuple[int, str, str]]]],
+    version: int = 1,
+) -> sqlite3.Row:
+    """``layers``: [(stratum_id, top_points, bottom_points)]，点为 (x, num, den)。"""
+    cur = conn.execute(
+        "INSERT INTO sections(site_id, trench, x_min, x_max, version) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (site_id, trench, x_min, x_max, version),
+    )
+    section_id = cur.lastrowid
+    for stratum_id, top, bottom in layers:
+        layer_cur = conn.execute(
+            "INSERT INTO section_layers(section_id, stratum_id) VALUES (?, ?)",
+            (section_id, stratum_id),
+        )
+        layer_id = layer_cur.lastrowid
+        conn.executemany(
+            "INSERT INTO section_points(section_layer_id, side, seq, x, y_num, y_den) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (layer_id, side, seq, x, num, den)
+                for side, points in (("top", top), ("bottom", bottom))
+                for seq, (x, num, den) in enumerate(points)
+            ],
+        )
+    return conn.execute(
+        "SELECT * FROM sections WHERE id = ?", (section_id,)
+    ).fetchone()
+
+
+def list_section_layers(
+    conn: sqlite3.Connection, section_id: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM section_layers WHERE section_id = ? ORDER BY id",
+        (section_id,),
+    ).fetchall()
+
+
+def get_section_points(
+    conn: sqlite3.Connection, section_layer_id: int, side: str
+) -> list[tuple[int, str, str]]:
+    rows = conn.execute(
+        "SELECT x, y_num, y_den FROM section_points "
+        "WHERE section_layer_id = ? AND side = ? ORDER BY seq",
+        (section_layer_id, side),
+    ).fetchall()
+    return [(r["x"], r["y_num"], r["y_den"]) for r in rows]
+
+
+def list_section_layers_for_stratum(
+    conn: sqlite3.Connection, stratum_id: int
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT sl.*, s.site_id, s.trench FROM section_layers sl "
+        "JOIN sections s ON s.id = sl.section_id WHERE sl.stratum_id = ?",
+        (stratum_id,),
+    ).fetchone()
+
+
+def replace_section_geometry(
+    conn: sqlite3.Connection,
+    section_id: int,
+    layers: list[tuple[int, list[tuple[int, str, str]], list[tuple[int, str, str]]]],
+    version: int,
+) -> None:
+    """整体替换剖面的分层与折线（调用方须在事务内）。"""
+    conn.execute(
+        "DELETE FROM section_points WHERE section_layer_id IN "
+        "(SELECT id FROM section_layers WHERE section_id = ?)",
+        (section_id,),
+    )
+    conn.execute("DELETE FROM section_layers WHERE section_id = ?", (section_id,))
+    for stratum_id, top, bottom in layers:
+        layer_cur = conn.execute(
+            "INSERT INTO section_layers(section_id, stratum_id) VALUES (?, ?)",
+            (section_id, stratum_id),
+        )
+        layer_id = layer_cur.lastrowid
+        conn.executemany(
+            "INSERT INTO section_points(section_layer_id, side, seq, x, y_num, y_den) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (layer_id, side, seq, x, num, den)
+                for side, points in (("top", top), ("bottom", bottom))
+                for seq, (x, num, den) in enumerate(points)
+            ],
+        )
+    conn.execute(
+        "UPDATE sections SET version = ?, updated = datetime('now') WHERE id = ?",
+        (version, section_id),
+    )
